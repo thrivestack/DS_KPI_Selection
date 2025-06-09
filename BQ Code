@@ -1,0 +1,685 @@
+BQ TSI KPI Selection SQL Code
+
+
+##Events View Creation 
+create or replace view `thrivestack.tsi_measurement.kpi_selection_events` as
+with
+   session_count as 
+  (SELECT 
+      user_pseudo_id,
+      count(distinct (SELECT COALESCE(value.string_value, CAST(COALESCE(value.double_value, value.int_value, value.float_value) AS STRING))
+       FROM UNNEST(event_params) WHERE key='ga_session_id')) as session_count,
+    FROM `rrd-ga-export.analytics_283970842.events_*`
+    GROUP BY user_pseudo_id),
+  session_len as 
+(select 
+  user_pseudo_id,
+  (SELECT COALESCE(value.string_value, CAST(COALESCE(value.double_value, value.int_value, value.float_value) AS STRING))
+  FROM UNNEST(event_params) WHERE key='ga_session_id') AS session_id,
+  TIMESTAMP_DIFF(
+  MAX(TIMESTAMP_MICROS(event_timestamp)), 
+  MIN(TIMESTAMP_MICROS(event_timestamp)), 
+  SECOND
+) AS session_length_seconds
+  from `rrd-ga-export.analytics_283970842.events_*`
+  group by 1,2
+)
+select 
+base.user_pseudo_id,
+(select coalesce(value.string_value,cast(coalesce(value.double_value,value.int_value,value.float_value) as string))
+from unnest(event_params) where key='ga_session_id') as session_id,
+case when session_count = 1 then 'single_session' when session_count > 1 then 'multi_session' else 'Other' end as user_journey,
+event_name,
+ TIMESTAMP_MICROS(event_timestamp) as event_timestamp,
+event_value_in_usd,
+--ecom fields
+ecommerce.purchase_revenue_in_usd AS purchase_revenue,
+ecommerce.total_item_quantity as total_item_quantity,
+ecommerce.unique_items as unique_items,
+(SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'coupon') AS transaction_coupon,
+--item fields
+item.quantity AS item_quantity,
+item.item_category AS item_category,
+item.item_id as item_id,
+item.price as item_unit_price,
+item.item_revenue_in_usd,
+--source medium fields
+session_traffic_source_last_click.manual_campaign.source,
+session_traffic_source_last_click.manual_campaign.medium,
+session_traffic_source_last_click.manual_campaign.campaign_name as utm_campaign,
+session_traffic_source_last_click.google_ads_campaign.campaign_name gads_campaign,
+case when 
+session_traffic_source_last_click.manual_campaign.medium = '(not set)'
+or session_traffic_source_last_click.manual_campaign.medium = 'organic'
+or session_traffic_source_last_click.manual_campaign.medium = 'email' 
+or (session_traffic_source_last_click.manual_campaign.medium = 'referral'
+and session_traffic_source_last_click.manual_campaign.source = 'tempur.com')
+then 'BOF'
+when lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%branded%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%rm%'  or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%rt%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%full-funnel%' or 
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%pmax%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%fullfunnel%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%>b>%'  or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%rlsa%' then 'BOF'
+when
+lower(session_traffic_source_last_click.manual_campaign.campaign_name)  like '%nonbrand%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%competitor%' or
+lower(session_traffic_source_last_click.manual_campaign.campaign_name) like '%acq%' then 'MOF'  
+ else 'MOF' end as funnel_category,
+regexp_extract((select value.string_value from unnest(event_params) where key='page_location'),'[^?]+') as page,
+case when event_name = 'scroll' then   
+(SELECT params.value.int_value 
+     FROM UNNEST(event_params) AS params
+     WHERE params.key = 'percent_scrolled') else null end as percent_scrolled,
+session_length_seconds,
+CASE WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/accounts|requests|help|warranties|register') THEN 'Account/Warranty Support'
+  WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/customer_service|product_care|shipping|privacy') THEN 'Other Support'
+  WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/compare') THEN 'Compare'
+    WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/finance') THEN 'Finance'
+  WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/tempur-love') THEN 'Explore'
+   WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/checkout/thank-you') THEN 'Checkout Complete'
+    -- Category 1: Generic offers page (exactly https://www.tempurpedic.com/offers/)
+    WHEN REGEXP_EXTRACT(
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),
+        '[^?]+'
+    ) = 'https://www.tempurpedic.com/offers/' THEN 'Offers_Main'
+    -- Category 2: Specific promo offers (contain 'offers' but also specific promo keywords)
+  WHEN REGEXP_CONTAINS(
+        REGEXP_EXTRACT(
+            (SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),
+            '[^?]+'
+        ), 
+        r'/offers'
+    ) 
+    AND REGEXP_CONTAINS(
+        REGEXP_EXTRACT(
+            (SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),
+            '[^?]+'
+        ),
+        r'(?i)(bogo|buy-one-get-one|black-friday|new-years|presidents-day|cyber-monday|veterans-day|holiday|memorial|labour)'
+    ) THEN 'Offers_Promo_Specific'
+    
+    -- Category 3: Non-promo offers (contain 'offers' but not specific promo keywords)
+    WHEN REGEXP_CONTAINS(
+        REGEXP_EXTRACT(
+            (SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),
+            '[^?]+'
+        ), 
+        r'/offers'
+    ) THEN 'Offers_Non_Promo'
+  WHEN REGEXP_CONTAINS(REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'), r'/find-a-retailer|tempur-pedic-stores|locations') THEN 'Location'
+  WHEN REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+') = 'https://www.tempurpedic.com/' THEN 'Homepage'
+  -- Main product page criteria
+  WHEN REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/(shop-mattresses|other-products|shop-pillows|bases-and-foundations|bedding|bases-and-foundations-v1|beddingold|activebreeze-sleep-bundle|pillows)/[^/]+($|/)'
+  ) 
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/all'
+  )
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/s/'
+  )
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'compare'
+  )
+  THEN 'Product'
+
+  -- Collection pages that should be considered product pages
+  WHEN REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'collection'
+  )
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/all|/s/|pillows'
+  )
+  THEN 'Product'
+  
+  ELSE 'Other'
+END AS page_type,
+
+-- New field for shopping_page
+CASE
+  -- Case 1: Contains category string but doesn't have anything following (no /more text)
+  WHEN REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/(shop-mattresses|other-products|shop-pillows|bases-and-foundations|bedding|bases-and-foundations-v1|beddingold|activebreeze-sleep-bundle|pillows)/?'
+  ) 
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/v'
+  )
+  THEN 'Shopping'
+  
+  -- Case 2: Contains category string, doesn't contain 'all' or '/s/' or 'v', but does contain 'pillows' or 'ba/' or 'compare'
+  WHEN REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/(shop-mattresses|other-products|shop-pillows|bases-and-foundations|bedding|bases-and-foundations-v1|beddingold|activebreeze-sleep-bundle|pillows)'
+  )
+  AND NOT REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/v'
+  )
+  AND REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'pillows|ba/|compare|all|/s/'
+  )
+  THEN 'Shopping'
+  
+  ELSE 'Not Shopping'
+END AS shopping_page,
+  REGEXP_EXTRACT(
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),
+    r'/(shop-mattresses|other-products|shop-pillows|bases-and-foundations|bedding|bases-and-foundations-v1|beddingold|activebreeze-sleep-bundle|pillows)'
+  ) as product_type,
+  case  
+  WHEN REGEXP_CONTAINS(
+    REGEXP_EXTRACT((SELECT value.string_value FROM UNNEST(event_params) WHERE key='page_location'),'[^?]+'),
+    r'/v/'
+  ) 
+  THEN'Product Variant Page' ELSE 'Other'
+   END
+    as product_variant_page
+FROM
+  `rrd-ga-export.analytics_283970842.events_*` base
+  LEFT JOIN UNNEST(base.items) AS item ON TRUE
+left join session_count sc on base.user_pseudo_id = sc.user_pseudo_id
+LEFT JOIN session_len sl ON 
+  base.user_pseudo_id = sl.user_pseudo_id AND 
+  (SELECT COALESCE(value.string_value, CAST(COALESCE(value.double_value, value.int_value, value.float_value) AS STRING))
+   FROM UNNEST(base.event_params) WHERE key='ga_session_id') = sl.session_id
+
+
+
+--Events Table Creation
+
+drop table `thrivestack.tsi_measurement.kpi_selection_events_table`
+
+create table if not exists  `thrivestack.tsi_measurement.kpi_selection_events_table` (
+  user_pseudo_id string,
+  session_id string,
+  user_journey string,
+  event_name string,
+  event_timestamp timestamp,
+  event_value_in_usd numeric(21,2),
+  purchase_revenue numeric(21,2),
+  total_item_quantity int,
+  unique_items int,
+  item_quantity int,
+  item_category string,
+  item_id string,
+   item_unit_price numeric(21,2),
+  transaction_coupon string,
+  item_revenue_in_usd numeric(21,2),
+  source string,
+  medium string,
+  utm_campaign string,
+  gads_campaign string,
+  funnel_category string,
+  page string,
+  percent_scrolled int,
+  session_length_seconds int,
+  page_type string,
+  product_type string,
+  product_variant_page string)
+
+INSERT INTO `thrivestack.tsi_measurement.kpi_selection_events_table` 
+SELECT 
+  user_pseudo_id,
+  session_id,
+  user_journey,
+  event_name,
+  event_timestamp, 
+  CAST(event_value_in_usd AS NUMERIC) AS event_value_in_usd,
+  CAST(purchase_revenue AS NUMERIC) AS purchase_revenue,
+  total_item_quantity,
+  unique_items,
+  item_quantity,
+  item_category,
+  item_id,
+  cast(item_unit_price as numeric) as item_unit_price,
+  transaction_coupon,
+  CAST(item_revenue_in_usd AS NUMERIC) AS item_revenue_in_usd, 
+  source,
+  medium,
+  utm_campaign,
+  gads_campaign,
+  funnel_category,
+  page,
+  percent_scrolled,
+  session_length_seconds,
+  page_type,
+  product_type,
+  product_variant_page
+FROM `thrivestack.tsi_measurement.kpi_selection_events`
+
+
+
+--User View
+
+create or replace view `thrivestack.tsi_measurement.kpi_selection_user` as 
+with fup  as 
+(select 
+    user_pseudo_id,
+    min(event_timestamp) as first_purchase_time
+    from `thrivestack.tsi_measurement.kpi_selection_events_table`
+    where event_name = 'purchase'
+    group by 1),
+  pre_purchase_events as 
+(select 
+b.user_pseudo_id,
+session_id,
+user_journey,
+event_name,
+event_timestamp,
+event_value_in_usd,
+purchase_revenue,
+total_item_quantity,
+unique_items,
+item_quantity,
+item_category,
+item_id,
+item_unit_price,
+transaction_coupon,
+item_revenue_in_usd,
+source,
+medium,
+utm_campaign,
+gads_campaign,
+funnel_category,
+page,
+percent_scrolled,
+session_length_seconds,
+page_type,
+product_type,
+product_variant_page
+ from `thrivestack.tsi_measurement.kpi_selection_events_table` b 
+    left join fup on fup.user_pseudo_id = b.user_pseudo_id
+    where (fup.first_purchase_time IS NULL OR event_timestamp <= fup.first_purchase_time)  
+    order by event_timestamp asc),
+sessions_consol_pur as 
+(SELECT 
+   user_pseudo_id, 
+    session_id, 
+     ROUND(SUM(item_revenue_in_usd), 2) AS purchase_revenue, --event level value,duplicated at item/timestamp level
+     count(distinct event_timestamp) as count_purchases   
+    FROM pre_purchase_events 
+    WHERE event_name = 'purchase'
+    GROUP BY 1, 2),
+all_users_consol as(
+    select distinct 
+    user_pseudo_id, 
+    user_journey,
+    session_id
+    FROM pre_purchase_events),
+journey_length as(
+      select 
+      user_pseudo_id,
+      TIMESTAMP_DIFF(
+      MAX(event_timestamp), 
+      MIN(event_timestamp), 
+       DAY) AS journey_length_days
+       from pre_purchase_events
+       group by 1),
+  purchase_dates as (
+   select 
+  user_pseudo_id,
+  session_id,
+     cast(event_timestamp as date) event_date,
+     case 
+    when cast(event_timestamp as date) >= '2024-11-09' and cast(event_timestamp as date) <= '2024-11-12' or 
+  cast(event_timestamp as date) >= '2024-11-28' and cast(event_timestamp as date) <= '2024-12-03' or 
+   cast(event_timestamp as date) >= '2024-12-07' and cast(event_timestamp as date) <= '2024-12-10' or 
+    cast(event_timestamp as date) >= '2024-12-14' and cast(event_timestamp as date) <= '2024-12-17' or
+    cast(event_timestamp as date) >= '2024-12-26' and cast(event_timestamp as date) <= '2024-12-27' or
+    cast(event_timestamp as date) >= '2024-12-31' and  cast(event_timestamp as date) <= '2025-01-02'  or 
+    cast(event_timestamp as date) >= '2025-01-18' and  cast(event_timestamp as date) <= '2025-01-21'  or 
+    cast(event_timestamp as date) >= '2025-02-15' and  cast(event_timestamp as date) <= '2025-02-18'  or 
+    cast(event_timestamp as date) >= '2025-03-15' and  cast(event_timestamp as date) <= '2025-03-18'  or 
+    cast(event_timestamp as date) >= '2025-04-05' and  cast(event_timestamp as date) <= '2025-04-08'  or 
+    cast(event_timestamp as date) >= '2025-04-19' and  cast(event_timestamp as date) <= '2025-04-22'  or 
+    cast(event_timestamp as date) >= '2025-05-10' and  cast(event_timestamp as date) <= '2025-05-12'  then 'promo_day'
+ else 'evergreen' end as promo_dates,
+     count(event_timestamp) as count_purchases
+      from pre_purchase_events
+           where event_name = 'purchase'
+       group by 1,2,3,4),
+  pur_dates_consol as(
+     select 
+    user_pseudo_id,
+  session_id,
+    sum(case when promo_dates like '%promo%' then 1 else 0 end) as promo_purchase,
+      from purchase_dates
+      group by 1,2),
+ ordered_pvs as( 
+    SELECT
+    user_pseudo_id,
+    session_id,
+    event_timestamp,
+    page,
+    ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, session_id ORDER BY event_timestamp ASC) AS page_view_number
+    FROM pre_purchase_events
+    WHERE event_name = 'page_view'
+    and user_pseudo_id is not null),
+second_pv as 
+  (select 
+  user_pseudo_id,
+    session_id,
+    event_timestamp as second_pv_timestamp,
+    page_view_number
+    from ordered_pvs where page_view_number = 2
+  ),
+min_event_timestamp as 
+  (select user_pseudo_id, 
+  session_id,
+  min(event_timestamp) as min_timestamp
+  from pre_purchase_events
+  group by 1,2),
+time_on_lp as( 
+select 
+    base.user_pseudo_id,
+    base.session_id,
+    coalesce(TIMESTAMP_DIFF(sp.second_pv_timestamp, met.min_timestamp, SECOND), session_length_seconds) as time_on_lp,
+    max(session_length_seconds) as unique_session_seconds,
+    max(case when session_length_seconds < 1 then 1 else 0 end) as user_bounce,
+    from pre_purchase_events base 
+    left join min_event_timestamp met  on met.user_pseudo_id = base.user_pseudo_id 
+    and met.session_id = base.session_id 
+    left join second_pv sp on sp.user_pseudo_id = base.user_pseudo_id 
+    and sp.session_id = base.session_id 
+    group by 1,2,3),
+unique_items as
+    (select 
+     user_pseudo_id,
+    count(distinct item_id) as unique_item,
+    count(distinct item_category) as unique_categories_purchased,
+    sum(item_quantity) as total_items,
+    from pre_purchase_events
+    where event_name = 'purchase'
+    group by 1),
+unique_mattress_pur as 
+    (
+    select 
+    user_pseudo_id,
+    sum(item_quantity) as mattress_purchase_unique_count,
+    from pre_purchase_events
+    where event_name = 'purchase'
+    and item_category = 'mattress'
+    group by 1
+    ) ,
+  unique_base_pur as 
+      (
+    select 
+    user_pseudo_id,
+    sum(item_quantity) as base_purchase_unique_count,
+    from pre_purchase_events
+    where event_name = 'purchase'
+    and item_category = 'bed-base-adjustable'
+    group by 1
+    ),
+  unique_other_pur as 
+  (select
+  user_pseudo_id,
+  sum(item_quantity) as other_purchase_unique_count
+   from pre_purchase_events
+    where event_name = 'purchase'
+    and not item_category = 'bed-base-adjustable' and not item_category = 'mattress'
+    group by 1),
+user_funnel AS 
+    (SELECT
+    user_pseudo_id,
+    COUNT(DISTINCT trim(funnel_category)) AS distinct_funnel_categories,
+    MAX(CASE WHEN trim(funnel_category) = 'MOF' THEN 1 ELSE 0 END) AS has_MOF,
+    MAX(CASE WHEN trim(funnel_category) = 'BOF' THEN 1 ELSE 0 END) AS has_BOF
+    from pre_purchase_events
+    group by 1),
+count_sessions as
+    (select
+    user_pseudo_id,
+    count(distinct session_id) as count_sessions
+    from pre_purchase_events
+        group by 1),
+session_length as 
+    (select user_pseudo_id,
+    session_id,
+    max(session_length_seconds) as unique_session_seconds
+    from pre_purchase_events
+    group by 1,2),
+avg_session_length as 
+    (select
+    user_pseudo_id,
+    avg(unique_session_seconds) as avg_session_length
+    from session_length
+    group by 1),
+pdps as 
+    (select 
+    user_pseudo_id,
+    count(distinct case when product_type = 'shop-mattresses' then event_timestamp else null end) as mattress_pdp,
+    count(distinct case when product_type = 'bases-and-foundations' then event_timestamp else null end) as bases_foundations_pdp,
+    count(distinct case when not product_type = 'bases-and-foundations' and not product_type = 'shop-mattresses' then event_timestamp else null end) as other_product_pdp,
+    from
+  pre_purchase_events
+    where page_type = 'Product'
+    and event_name = 'page_view'
+      group by 1),
+atcs as 
+    (select 
+    user_pseudo_id,
+    count(distinct case when product_type = 'shop-mattresses' then event_timestamp else null end) as mattress_atc,
+    count(distinct case when product_type = 'bases-and-foundations' then event_timestamp else null end) as bases_foundations_atc,
+    count(distinct case when not product_type = 'bases-and-foundations' and not product_type = 'shop-mattresses' then event_timestamp else null end) as other_product_atc,
+    from
+  pre_purchase_events
+    where page_type = 'Product'
+    and event_name = 'add_to_cart'
+      group by 1),
+category_visits as 
+(select 
+  user_pseudo_id,
+  max(case when event_name = 'page_view' and page_type = 'Location' then 1 else 0 end) as visited_location_page,
+  max(case when event_name  = 'page_view' and page_type = 'Account/Warranty Support' then 1 else 0 end) as visited_account_support_page,
+  max(case when event_name  = 'page_view' and page_type = 'Other Support' then 1 else 0 end) as visited_other_support_page,
+  max(case when event_name  = 'page_view' and page_type = 'Compare' then 1 else 0 end) as visited_compare_page,
+  max(case when event_name = 'page_view' and page_type = 'Offers_Main' then 1 else 0 end) as visited_main_offers_page,
+  max(case when event_name = 'page_view' and page_type = 'Offers_Promo_Specific' then 1 else 0 end) as visited_promo_offers_page,
+   max(case when event_name = 'page_view' and page_type = 'Offers_Non_Promo' then 1 else 0 end) as visited_other_offers_page,
+  max(case when event_name  = 'page_view' and page_type = 'Explore' then 1 else 0 end) as visited_explore_page,
+  max(case when event_name  = 'page_view' and page_type = 'Finance' then 1 else 0 end) as visited_finance_page
+  from pre_purchase_events 
+  group by 1),
+  scroll_depth as
+(select 
+  user_pseudo_id,
+  sum(case when page_type = 'Product' and percent_scrolled > 50 then 1 else 0 end) as product_page_scrolls_50
+  from pre_purchase_events
+  group by 1),
+item_level_discounts as 
+(select 
+user_pseudo_id,
+session_id,
+item_id, 
+event_timestamp,
+item_unit_price as transaction_price,
+transaction_coupon,
+    from pre_purchase_events
+    where event_name = 'purchase'),
+has_discounted_purchase as 
+  (SELECT 
+    DISTINCT
+    user_pseudo_id,
+    CASE 
+      WHEN COUNT(CASE WHEN transaction_coupon IS NULL THEN NULL ELSE 1 END) > 0 THEN 1 
+      ELSE 0 
+    END AS discounted_purchase
+  FROM
+    item_level_discounts
+  GROUP BY 1)
+select 
+      auc.user_pseudo_id,
+      auc.user_journey,
+        case when distinct_funnel_categories > 1 then 'Multi_Funnel' else 
+          (case when has_BOF = 1 then 'BOF' 
+          when has_MOF = 1 then 'MOF' end) end as funnel_position,
+      ui.unique_item as total_unique_items_purchased,
+      ui.total_items as total_items_purchased,
+      ui.unique_categories_purchased,
+      count_sessions,
+      ifnull(mattress_purchase_unique_count,0) as mattress_purchase_unique_count,
+      ifnull(base_purchase_unique_count, 0) as base_purchase_unique_count,
+      ifnull(other_purchase_unique_count,0) as other_purchase_unique_count,
+    CASE 
+    WHEN COALESCE(mattress_pdp, 0) - COALESCE(mattress_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(mattress_pdp, 0) - COALESCE(mattress_purchase_unique_count, 0)
+    END AS add_mattress_pdp,
+    CASE 
+    WHEN COALESCE(bases_foundations_pdp, 0) - COALESCE(base_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(bases_foundations_pdp, 0) - COALESCE(base_purchase_unique_count, 0)
+    END AS add_base_pdp,
+    CASE 
+    WHEN COALESCE(other_product_pdp, 0) - COALESCE(other_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(other_product_pdp, 0) - COALESCE(other_purchase_unique_count, 0)
+    END AS add_other_pdp,
+    CASE 
+    WHEN COALESCE(mattress_atc, 0) - COALESCE(mattress_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(mattress_atc, 0) - COALESCE(mattress_purchase_unique_count, 0)
+    END AS add_mattress_atc,
+    CASE 
+    WHEN COALESCE(bases_foundations_atc, 0) - COALESCE(base_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(bases_foundations_atc, 0) - COALESCE(base_purchase_unique_count, 0)
+    END AS add_base_atc,
+    CASE 
+    WHEN COALESCE(other_product_atc, 0) - COALESCE(other_purchase_unique_count, 0) < 0 THEN 0 
+    ELSE COALESCE(other_product_atc, 0) - COALESCE(other_purchase_unique_count, 0)
+    END AS add_other_atc,
+      ceil(avg_session_length) as avg_session_len_seconds,
+    visited_location_page,
+    visited_explore_page,
+    visited_account_support_page,
+    visited_other_support_page,
+    visited_compare_page,
+    visited_main_offers_page,
+    visited_promo_offers_page,
+    visited_other_offers_page,
+    visited_finance_page,
+    product_page_scrolls_50,
+    journey_length_days,
+    discounted_purchase,
+    sum(user_bounce) as count_user_bounces,
+    avg(time_on_lp) as avg_lp_time,
+    round(sum(sc.purchase_revenue),2) as total_user_purchase_revenue,
+    sum(sl.unique_session_seconds) as total_seconds,
+    sum(ifnull(promo_purchase, 0)) as promo_purchase,
+    sum(count_purchases) as count_purchases
+      from all_users_consol auc
+      left join sessions_consol_pur sc on sc.user_pseudo_id = auc.user_pseudo_id and sc.session_id = auc.session_id
+      left join unique_items ui on auc.user_pseudo_id = ui.user_pseudo_id
+      left join user_funnel uf on auc.user_pseudo_id = uf.user_pseudo_id
+      left join count_sessions cs on auc.user_pseudo_id = cs.user_pseudo_id
+      left join session_length sl on auc.user_pseudo_id = sl.user_pseudo_id and sl.session_id = auc.session_id
+      left join avg_session_length asl on auc.user_pseudo_id = asl.user_pseudo_id
+      left join unique_mattress_pur ump on auc.user_pseudo_id = ump.user_pseudo_id
+       left join unique_base_pur ubp on auc.user_pseudo_id = ubp.user_pseudo_id
+      left join unique_other_pur uop on auc.user_pseudo_id = uop.user_pseudo_id
+      left join pdps pdp on auc.user_pseudo_id = pdp.user_pseudo_id
+      left join atcs atc on auc.user_pseudo_id = atc.user_pseudo_id
+      left join category_visits cv on auc.user_pseudo_id = cv.user_pseudo_id
+      left join journey_length jl on jl.user_pseudo_id = auc.user_pseudo_id
+      left join scroll_depth sd on auc.user_pseudo_id = sd.user_pseudo_id
+      left join pur_dates_consol pdc on auc.user_pseudo_id = pdc.user_pseudo_id and auc.session_id = pdc.session_id
+      left join has_discounted_purchase hdp on hdp.user_pseudo_id = auc.user_pseudo_id 
+      left join second_pv sp on sp.user_pseudo_id = auc.user_pseudo_id and sp.session_id = auc.session_id 
+      left join time_on_lp tol on tol.user_pseudo_id = auc.user_pseudo_id  and tol.session_id = auc.session_id 
+      group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
+      order by total_unique_items_purchased desc
+
+
+-- User Table Creation
+
+drop table `thrivestack.tsi_measurement.kpi_selection_user_table`
+
+
+create table if not exists `thrivestack.tsi_measurement.kpi_selection_user_table` (
+  user_pseudo_id string,
+  user_journey string,
+  funnel_position string,
+  total_unique_items_purchased int,
+  total_items_purchased int,
+  unique_categories_purchased int,
+  count_sessions bigint,
+  mattress_purchase_unique_count int,
+  bba_purchase_unique_count int,
+  other_purchase_unique_count int,
+  add_mattress_pdp int,
+  add_base_pdp int,
+  add_other_pdp int,
+  add_mattress_atc int,
+  add_base_atc int,
+  add_other_atc int,
+  avg_session_len_seconds float64,
+  visited_location_page int,
+  visited_explore_page int,
+  visited_account_support_page int,
+  visited_other_support_page int,
+  visited_compare_page int,
+  visited_main_offers_page int,
+  visited_promo_offers_page int,
+   isited_other_offers_page int,
+  visited_finance_page int,
+  product_page_scrolls_50 int,
+  promo_purchase int,
+  count_users_bounced int,
+  avg_lp_time float64,
+  journey_length_days bigint,
+  discounted_purchase int,
+  total_user_purchase_revenue float64,
+  count_purchases int,
+  total_seconds bigint)
+
+insert into  `thrivestack.tsi_measurement.kpi_selection_user_table`
+select 
+  user_pseudo_id,
+  user_journey,
+  funnel_position,
+  total_unique_items_purchased,
+  total_items_purchased,
+  unique_categories_purchased,
+  count_sessions,
+  mattress_purchase_unique_count,
+  base_purchase_unique_count,
+  other_purchase_unique_count,
+  add_mattress_pdp,
+  add_base_pdp,
+  add_other_pdp,
+  add_mattress_atc,
+  add_base_atc,
+  add_other_atc,
+  avg_session_len_seconds,
+  visited_location_page,
+  visited_explore_page,
+  visited_account_support_page,
+  visited_other_support_page,
+  visited_compare_page,
+  visited_main_offers_page,
+  visited_promo_offers_page,
+  visited_other_offers_page,
+  visited_finance_page,
+  product_page_scrolls_50,
+  promo_purchase,
+  count_user_bounces,
+  avg_lp_time,
+  journey_length_days,
+  discounted_purchase,
+  ifnull(total_user_purchase_revenue, 0) float64,
+  count_purchases,
+  total_seconds bigint
+from `thrivestack.tsi_measurement.kpi_selection_user`
+
+
+
+ 
